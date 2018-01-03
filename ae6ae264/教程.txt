@@ -1,0 +1,244 @@
+ tcpdump使用实例——基于ip统计流量
+
+自由转载 ^_^ 　　同时请注明原文出处：http://www.cnblogs.com/wangvsa/archive/2012/07/16/2593551.html
+
+ 
+
+tcpdump - dump traffic on a network
+
+ 
+
+问题：基于ip统计流量。
+
+硬件：学校集群
+
+resource_04.gif
+
+难点：
+
+　　1.当使用高速网卡(千兆或IB)并且网卡满负荷时丢包率如何
+
+　　2.程序的cpu占用率如何
+
+　　3.日志文件过大
+
+方案及分析：
+
+　　1.抓包的实现方式有多种，如用libpcap库、采用零拷贝方式、使用PF_RING接口、直接使用系统函数
+
+我看了一些文章并测试了netsniff-ng程序(基于零拷贝)，我认为零拷贝方式效率最高，丢包率最低。但是我
+
+测试tcpdump时发现其效率也较高(测试时网卡几乎满负荷)，并且几乎没有丢包，又由于其方便使用等其他
+
+因素最终选用tcpdump。
+
+　　2.测试tcpdump抓包时cpu占用率4%左右
+
+　　3.tcpdump由于记录每个数据包，虽然我们可以限制每个包记录的字节数(-s选项)，但是由于网卡满负荷，
+
+所以包的数量格外大。 如下，60秒已经抓到748168个包，导致pcap文件也格外大
+Number of packets: 748168 
+File size: 58394582 bytes
+Data size: 3900660165 bytes
+Capture duration: 59.963470 seconds
+
+ 　　因此，我使用-G选项每分钟记录一个pcap文件然后自己统计删减其中数据，最后删掉该pcap文件。即每分钟
+
+生成一个如下的文件（时间间隔可以根据需要改）
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+	
+File name: /public/home/wangvsa/software/tcp-audit/2012-07-16,12:54:54.pcap
+File encapsulation: Ethernet
+Number of packets: 748168
+File size: 58394582 bytes
+Data size: 3900660165 bytes
+Capture duration: 59.963470 seconds
+Start time: Mon Jul 16 12:54:53 2012
+End time: Mon Jul 16 12:55:53 2012
+Data rate: 65050607.75 bytes/s
+Data rate: 520404861.98 bits/s
+ 
+ 
+IPv4 total packet:   748037
+       source ip  port   dir            dest ip  port   proto   flow
+ 10. 10. 10. 61:  9090    >     10. 10. 10. 49: 27884    tcp 1793
+  0.  0.  0.  0:    68    >    255.255.255.255:    67    UDP 5310
+ 10. 10. 10. 49:     -    >     10. 10. 10. 62:     -    ICMP    234
+ 10. 10. 10. 49:    22    >     10. 10. 10. 61: 47051    tcp 117124
+ 10. 10. 10. 48: 38906    >     10. 10. 10. 49: 16797    tcp 44288974
+ 10. 10. 10. 48: 64468    >     10. 10. 10. 49: 45094    tcp 171
+ 10. 10. 10. 61: 47051    >     10. 10. 10. 49:    22    tcp 5406
+ 10. 10. 10. 49: 27884    >     10. 10. 10. 61:  9090    tcp 2112
+ 10. 10. 10. 49: 45094    >     10. 10. 10. 48: 64468    tcp 108
+ 10. 10. 10. 62:     -    >     10. 10. 10. 49:     -    ICMP    234
+ 10. 10. 10. 49: 16797    >     10. 10. 10. 48: 38906    tcp 3856230180
+
+具体实现： 　　
+
+　　1.编写针对pcap文件的统计脚本(如果对效率要求高可以写成c语言程序)，共两个文件tcp-audit.sh 和
+
+tcp-reduce.sh。在tcp-audit.sh中调用了tcp-reduce.sh，自己不要直接调用。
+
+　　先看tcp-audit.sh，这个文件从ready.txt中读取内容，每一行都是一个要统计的pcap文件的文件名，稍后
+
+讨论如何得到的ready.txt文件。
+复制代码
+
+ 1 #!/bin/bash
+ 2 # tcp-audit.sh
+ 3 # 读取ready.txt文件，每次读取一行
+ 4 # 将其内容作为参数传给tcp-reduce.sh
+ 5 # 执行完后删除该行
+ 6 
+ 7 DIR="/home/wangchen/shell_ex/"
+ 8 
+ 9 while read line
+10 do
+11     # tcp-reduce.sh处理
+12     $DIR/tcp-reduce.sh ${line}
+13     # 删除该pcap文件
+14     rm $DIR/${line}
+15     # 删除该行
+16     sed -i '1d' $DIR/ready.txt
+17 done < $DIR/ready.txt
+
+复制代码
+
+　　再看tcp-reduce.sh，这个脚本完成了所有的统计操作并且输出到日志文件中。这个脚本中使用了grep和sed命令
+
+来格式话pcap文件的输出方便之后awk程序的使用。还是用了capinfos这个程序提供的一些分析数据。
+
+注：tcpdump 和 capinfos 版本不同，其参数选项要注意修改。如capinfos 的-x在旧版本中是用-i
+复制代码
+
+ 1 #!/bin/bash
+ 2 # tcp-reduce.sh
+ 3 DIR="/home/wangchen/shell_ex"
+ 4 
+ 5 # 根据pcap文件名构造出日志文件名(以时间命名)
+ 6 tmp1=$*
+ 7 tmp2=(${tmp1//./ })
+ 8 LOG_FILE_NAME=${tmp2[0]}".log"
+ 9 
+10 # 输出文件信息，即网卡信息
+11 capinfos -a -c -d -e -E -s -u -x -y $DIR/$* >> $DIR/$LOG_FILE_NAME
+12 
+13 # 将tcpdump文件生成可读文本
+14 # 由grep，sed执行过滤、替换处理后交给awk
+15 # 使用awk语言处理数据行，统计基于ip的流量信息 
+16 tcpdump -q -n -e -t -r $DIR/$* \
+17 | grep "IPv4" | sed 's/,/ /g; s/>/ /g; s/://g' \
+18 | awk '      
+19 
+20 BEGIN {
+21     printf("\n")
+22 }
+23 {
+24     # $5:packet length
+25     # $6:source ip.port
+26     # $7:destination ip.port
+27     # $8:proto
+28 
+29     # array_flow是数组记录每个方向的流量
+30     # 其下标是数据传输方向(字符串)
+31 
+32     count++
+33     way = $6"."$7"."$8
+34     for(x in arr_total_flow)    
+35     { 
+36     if(way==x)
+37     {
+38         arr_total_flow[way] += $5
+39         next
+40     }
+41     }
+42     arr_total_flow[way] = $5
+43 }
+44 
+45 END {
+46     printf("\nIPv4 total packet:   %d\n",NR) 
+47     printf("%16s%6s%6s%19s%6s\tproto\tflow\n","source ip","port","dir","dest ip","port")
+48     for(x in arr_total_flow)
+49     {
+50     # 格式化输出
+51     split(x,chunks,".")
+52     if(chunks[9]=="ICMP")
+53     {
+54         printf("%3s.%3s.%3s.%3s:%6s    >    %3s.%3s.%3s.%3s:%6s\t%s\t%d\n",
+55         chunks[1],chunks[2],chunks[3],chunks[4],"-",        # 源地址 : 端口
+56         chunks[5],chunks[6],chunks[7],chunks[8],"-",        # 目的地址 : 端口
+57         chunks[9],arr_total_flow[x])                　　　　 # 协议 总流量
+58     }
+59     else
+60     {
+61         printf("%3s.%3s.%3s.%3s:%6s    >    %3s.%3s.%3s.%3s:%6s\t%s\t%d\n",
+62         chunks[1],chunks[2],chunks[3],chunks[4],chunks[5],     # 源地址 : 端口
+63         chunks[6],chunks[7],chunks[8],chunks[9],chunks[10],    # 目的地址 : 端口
+64         chunks[11],arr_total_flow[x])                　　　　　　# 协议 总流量
+65     }
+66     }
+67 }
+68 ' >> $DIR/$LOG_FILE_NAME
+
+复制代码
+
+　　2.接下来就是如何运行的问题，首先用root权限执行tcpdump抓包程序，我使用的命令如下：
+
+sudo cpdump -i eth3 -s 84 -G 60 -z ./tcp-add.sh -w %F,%T.pcap
+
+参数分析：-i eth3 在eth3上抓包； -s 84每个包最多记录84字节； -G 60 每60秒就在打开一个文件记录；
+
+　　　　　-z  ./tcp-add.sh配合-G使用，每次记录完一个文件后执行./tcp-add.sh脚本(后面讲这个脚本)
+
+　　　　　-w %F,%T.pcap 输出，文件名有时间组成%F表示年月日，%T表示时分秒，如2012-07-16,12:54:54.pcap
+
+再来看这个tcp-add.sh，这个脚本十分简单，实际就是将刚才的记录完的pcap文件名写到ready.txt文件中。
+
+1 #!/bin/bash
+2 # 作为tcpdump的-z参数使用
+3 # 将已经存储完的pcap文件名加入ready.txt等待处理
+4 
+5 echo $* >> ready.txt
+
+这样就会每分钟生成一个pcap文件，并将其文件名写到ready.txt文件中。
+
+　　3.下面就要用到cron来定时执行我们的统计任务。在开启crond服务后执行如下命令
+
+1 sudo crontab -e
+
+此命令打开一个文件，在最后一行加入如下，之后保存退出
+
+1 */2 * * * * /home/wangchen/shell_ex/tcp-audit.sh
+
+这一条表示每两分钟（时间随意定）执行一次tcp-audit.sh脚本。
+
+ 
+
+到此功能就基本实现，在集群中实测可行。
+
+当然以上方案仅仅是一个我在实验室的一个练习，肯定有很多的不足，希望高手能不惜赐教。
+标签: 抓包, tcudump, ip流量, 数据包, sed, awk
